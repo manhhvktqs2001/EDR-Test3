@@ -1,469 +1,394 @@
 from .connection import DatabaseConnection
 from datetime import datetime, timedelta
 import logging
-import sqlite3
+from typing import Dict, List, Optional, Any
 
-logger = logging.getLogger('EDR_Server')
+logger = logging.getLogger(__name__)
 
 class AgentDB:
     def __init__(self):
         self.db = DatabaseConnection()
         self.db.connect()
 
-    def register_or_update(self, hostname, os_type, os_version, arch, ip, mac, agent_version):
-        """Đăng ký mới hoặc cập nhật agent theo hostname."""
+    def register_agent(self, agent_data: Dict) -> bool:
+        """Register or update agent with dynamic field mapping"""
         try:
-            # Nếu agent đã tồn tại thì update, chưa có thì insert
-            query = """
-            IF EXISTS (SELECT 1 FROM Agents WHERE Hostname = ?)
-                UPDATE Agents SET OSType=?, OSVersion=?, Architecture=?, IPAddress=?, MACAddress=?, AgentVersion=?, Status='Online', IsActive=1, LastHeartbeat=GETDATE(), LastSeen=GETDATE() WHERE Hostname=?
-            ELSE
-                INSERT INTO Agents (Hostname, OSType, OSVersion, Architecture, IPAddress, MACAddress, AgentVersion, Status, IsActive, FirstSeen, LastHeartbeat, LastSeen)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 'Online', 1, GETDATE(), GETDATE(), GETDATE())
-            """
-            self.db.execute_query(query, (
-                hostname, os_type, os_version, arch, ip, mac, agent_version, hostname,  # update params
-                hostname, os_type, os_version, arch, ip, mac, agent_version            # insert params
-            ))
-            logging.info(f"SUCCESS: Agent updated - {hostname}")
-            return True
+            if not agent_data:
+                logging.error("Empty agent data received")
+                return False
+            
+            # Extract hostname for validation
+            hostname = self._extract_hostname(agent_data)
+            if not hostname or hostname in ['Unknown', 'Windows', 'Linux']:
+                logging.error(f"Invalid hostname: {hostname}")
+                return False
+            
+            # Normalize agent data
+            normalized_data = self._normalize_agent_data(agent_data)
+            if not normalized_data:
+                logging.error("Failed to normalize agent data")
+                return False
+            
+            # Check if agent already exists
+            existing_agent = self.get_agent(hostname)
+            
+            if existing_agent:
+                # Update existing agent
+                success = self._update_agent(hostname, normalized_data)
+                if success:
+                    logging.info(f"Agent updated: {hostname}")
+                else:
+                    logging.error(f"Failed to update agent: {hostname}")
+            else:
+                # Register new agent
+                success = self._register_new_agent(normalized_data)
+                if success:
+                    logging.info(f"New agent registered: {hostname}")
+                    # Assign rules to new agent
+                    self._assign_rules_to_agent(hostname, normalized_data.get('OSType', 'Unknown'))
+                else:
+                    logging.error(f"Failed to register new agent: {hostname}")
+            
+            return success
+            
         except Exception as e:
-            logging.error(f"ERROR: Failed to update agent - {e}")
+            logging.error(f"Error registering agent: {e}")
             return False
 
-    def update_status(self, hostname, status):
-        """Cập nhật trạng thái agent."""
-        try:
-            query = "UPDATE Agents SET Status=?, LastSeen=GETDATE() WHERE Hostname=?"
-            self.db.execute_query(query, (status, hostname))
-            logging.info(f"SUCCESS: Agent status updated - {hostname} ({status})")
-            return True
-        except Exception as e:
-            logging.error(f"ERROR: Failed to update agent status - {e}")
-            return False
+    def _extract_hostname(self, agent_data: Dict) -> Optional[str]:
+        """Extract hostname from various possible field names"""
+        hostname_fields = ['Hostname', 'hostname', 'host', 'computer_name', 'ComputerName', 'name', 'Name']
+        
+        for field in hostname_fields:
+            if field in agent_data and agent_data[field]:
+                return str(agent_data[field]).strip()
+        
+        return None
 
-    def update_heartbeat(self, hostname):
-        """Cập nhật thời gian heartbeat cho agent."""
+    def _normalize_agent_data(self, agent_data: Dict) -> Optional[Dict]:
+        """Normalize agent data with dynamic field mapping"""
         try:
-            query = "UPDATE Agents SET LastHeartbeat = GETDATE(), LastSeen = GETDATE(), Status = 'Online' WHERE Hostname = ?"
-            self.db.execute_query(query, (hostname,))
-            logging.info(f"SUCCESS: Agent heartbeat updated - {hostname}")
-            return True
+            # Get table schema
+            schema = self.db.get_table_schema('Agents')
+            if not schema:
+                logging.error("No schema found for Agents table")
+                return None
+            
+            available_columns = set(schema.get('columns', {}).keys())
+            normalized = {}
+            
+            # Field mapping for various possible field names
+            field_mappings = {
+                'Hostname': ['Hostname', 'hostname', 'host', 'computer_name', 'ComputerName', 'name'],
+                'OSType': ['OSType', 'os_type', 'operating_system', 'os', 'platform', 'system'],
+                'OSVersion': ['OSVersion', 'os_version', 'version', 'os_ver', 'operating_system_version'],
+                'Architecture': ['Architecture', 'architecture', 'arch', 'platform_arch', 'processor_arch'],
+                'IPAddress': ['IPAddress', 'ip_address', 'ip', 'local_ip', 'address'],
+                'MACAddress': ['MACAddress', 'mac_address', 'mac', 'hardware_address', 'physical_address'],
+                'AgentVersion': ['AgentVersion', 'agent_version', 'version', 'client_version', 'software_version'],
+                'Status': ['Status', 'status', 'state', 'connection_status'],
+                'IsActive': ['IsActive', 'is_active', 'active', 'enabled']
+            }
+            
+            # Map fields dynamically
+            for db_field, possible_names in field_mappings.items():
+                if db_field in available_columns:
+                    value = self._extract_field_value(agent_data, possible_names)
+                    if value is not None:
+                        normalized[db_field] = self._convert_agent_field_value(db_field, value)
+            
+            # Set default values for required fields if missing
+            self._set_agent_defaults(normalized)
+            
+            # Validate required fields
+            required_fields = ['Hostname', 'OSType']
+            missing_fields = [field for field in required_fields if field not in normalized or not normalized[field]]
+            
+            if missing_fields:
+                logging.error(f"Missing required agent fields: {missing_fields}")
+                return None
+            
+            return normalized
+            
         except Exception as e:
-            logging.error(f"ERROR: Failed to update agent heartbeat - {e}")
-            return False
-
-    def get_all_agents(self):
-        """Lấy danh sách tất cả agent."""
-        try:
-            query = "SELECT AgentID, Hostname, OSType, OSVersion, Architecture, IPAddress, MACAddress, AgentVersion, Status, LastHeartbeat, LastSeen FROM Agents WHERE IsActive=1"
-            rows = self.db.execute_query(query)
-            agents = []
-            if rows:
-                for row in rows:
-                    agents.append({
-                        "agent_id": row.AgentID,
-                        "hostname": row.Hostname,
-                        "os_type": row.OSType,
-                        "os_version": row.OSVersion,
-                        "architecture": row.Architecture,
-                        "ip_address": row.IPAddress,
-                        "mac_address": row.MACAddress,
-                        "agent_version": row.AgentVersion,
-                        "status": row.Status,
-                        "last_heartbeat": row.LastHeartbeat.strftime('%Y-%m-%d %H:%M:%S') if row.LastHeartbeat else None,
-                        "last_seen": row.LastSeen.strftime('%Y-%m-%d %H:%M:%S') if row.LastSeen else None
-                    })
-            return agents
-        except Exception as e:
-            logging.error(f"Error getting agents: {e}")
-            return []
-
-    def get_agent(self, hostname):
-        """Lấy thông tin chi tiết agent theo hostname."""
-        try:
-            query = "SELECT AgentID, Hostname, OSType, OSVersion, Architecture, IPAddress, MACAddress, AgentVersion, Status, LastHeartbeat, LastSeen FROM Agents WHERE Hostname=?"
-            rows = self.db.execute_query(query, (hostname,))
-            if rows and len(rows) > 0:
-                row = rows[0]
-                return {
-                    "agent_id": row.AgentID,
-                    "hostname": row.Hostname,
-                    "os_type": row.OSType,
-                    "os_version": row.OSVersion,
-                    "architecture": row.Architecture,
-                    "ip_address": row.IPAddress,
-                    "mac_address": row.MACAddress,
-                    "agent_version": row.AgentVersion,
-                    "status": row.Status,
-                    "last_heartbeat": row.LastHeartbeat.strftime('%Y-%m-%d %H:%M:%S') if row.LastHeartbeat else None,
-                    "last_seen": row.LastSeen.strftime('%Y-%m-%d %H:%M:%S') if row.LastSeen else None
-                }
+            logging.error(f"Error normalizing agent data: {e}")
             return None
+
+    def _extract_field_value(self, agent_data: Dict, possible_names: List[str]) -> Any:
+        """Extract field value from agent data using possible field names"""
+        for name in possible_names:
+            if name in agent_data and agent_data[name] is not None:
+                return agent_data[name]
+        return None
+
+    def _convert_agent_field_value(self, field_name: str, value: Any) -> Any:
+        """Convert agent field value to appropriate type"""
+        if value is None or value == '':
+            return None
+            
+        field_lower = field_name.lower()
+        
+        try:
+            # Boolean fields
+            if 'active' in field_lower or 'enabled' in field_lower:
+                if isinstance(value, bool):
+                    return value
+                if isinstance(value, str):
+                    return value.lower() in ['true', '1', 'yes', 'on', 'active']
+                return bool(value)
+            
+            # String fields - clean up
+            else:
+                str_value = str(value).strip()
+                if str_value.upper() in ['NULL', 'NONE']:
+                    return ''
+                return str_value
+                
+        except (ValueError, TypeError) as e:
+            logging.warning(f"Error converting agent value '{value}' for field '{field_name}': {e}")
+            return str(value) if value else ''
+
+    def _set_agent_defaults(self, normalized: Dict):
+        """Set default values for agent fields"""
+        defaults = {
+            'Status': 'Online',
+            'IsActive': True,
+            'Architecture': '',
+            'IPAddress': '',
+            'MACAddress': '',
+            'AgentVersion': '1.0.0'
+        }
+        
+        for field, default_value in defaults.items():
+            if field not in normalized or normalized[field] is None:
+                normalized[field] = default_value
+
+    def _register_new_agent(self, agent_data: Dict) -> bool:
+        """Register new agent in database"""
+        try:
+            success = self.db.insert_data('Agents', agent_data)
+            return success
+        except Exception as e:
+            logging.error(f"Error registering new agent: {e}")
+            return False
+
+    def _update_agent(self, hostname: str, agent_data: Dict) -> bool:
+        """Update existing agent"""
+        try:
+            # Remove hostname from update data to avoid conflicts
+            update_data = {k: v for k, v in agent_data.items() if k != 'Hostname'}
+            
+            # Add update timestamp
+            update_data['LastSeen'] = 'GETDATE()'
+            update_data['LastHeartbeat'] = 'GETDATE()'
+            
+            success = self.db.update_data('Agents', update_data, 'Hostname = ?', [hostname])
+            return success
+        except Exception as e:
+            logging.error(f"Error updating agent {hostname}: {e}")
+            return False
+
+    def _assign_rules_to_agent(self, hostname: str, os_type: str):
+        """Assign rules to newly registered agent"""
+        try:
+            # Get global rules
+            global_rules_query = """
+                SELECT RuleID FROM Rules
+                WHERE IsActive = 1 AND IsGlobal = 1
+            """
+            global_rules = self.db.execute_query(global_rules_query)
+            
+            # Get OS-specific rules
+            os_rules_query = """
+                SELECT RuleID FROM Rules
+                WHERE IsActive = 1 AND IsGlobal = 0 AND OSType = ?
+            """
+            os_rules = self.db.execute_query(os_rules_query, [os_type])
+            
+            # Combine all applicable rules
+            all_rules = []
+            if global_rules:
+                all_rules.extend([row[0] for row in global_rules.fetchall()])
+            if os_rules:
+                all_rules.extend([row[0] for row in os_rules.fetchall()])
+            
+            # Assign rules to agent
+            assigned_count = 0
+            for rule_id in all_rules:
+                rule_assignment = {
+                    'RuleID': rule_id,
+                    'Hostname': hostname,
+                    'IsActive': True
+                }
+                
+                if self.db.insert_data('AgentRules', rule_assignment):
+                    assigned_count += 1
+            
+            logging.info(f"Assigned {assigned_count} rules to agent {hostname}")
+            
+        except Exception as e:
+            logging.error(f"Error assigning rules to agent {hostname}: {e}")
+
+    def get_agent(self, hostname: str) -> Optional[Dict]:
+        """Get agent information by hostname"""
+        try:
+            query = "SELECT * FROM Agents WHERE Hostname = ?"
+            cursor = self.db.execute_query(query, [hostname])
+            
+            if cursor:
+                columns = [column[0] for column in cursor.description]
+                row = cursor.fetchone()
+                
+                if row:
+                    agent_dict = {}
+                    for i, value in enumerate(row):
+                        col_name = columns[i]
+                        # Convert datetime to string
+                        if hasattr(value, 'strftime'):
+                            agent_dict[col_name] = value.strftime('%Y-%m-%d %H:%M:%S')
+                        else:
+                            agent_dict[col_name] = value
+                    return agent_dict
+            
+            return None
+            
         except Exception as e:
             logging.error(f"Error getting agent {hostname}: {e}")
             return None
 
-    def register_agent(self, agent_data):
-        """Register a new agent or update existing one, then assign rules."""
+    def get_all_agents(self) -> List[Dict]:
+        """Get all active agents"""
         try:
-            # Nếu hostname không hợp lệ thì bỏ qua
-            if not agent_data.get('Hostname') or agent_data.get('Hostname') in ['Unknown', 'Windows']:
-                logging.error(f"Skip register agent with invalid hostname: {agent_data}")
-                return False
-
-            # Nếu agent đã tồn tại thì bỏ qua
-            if self.get_agent(agent_data.get('Hostname')):
-                logging.info(f"Agent {agent_data.get('Hostname')} already exists. Skip register and rule assignment.")
-                return True
-
-            # Chuẩn bị params với giá trị mặc định là chuỗi rỗng nếu None
-            params = [
-                agent_data.get('Hostname'),
-                agent_data.get('OSType'),
-                agent_data.get('OSVersion'),
-                agent_data.get('Architecture') or "",
-                agent_data.get('IPAddress') or "",
-                agent_data.get('MACAddress') or "",
-                agent_data.get('AgentVersion')
-            ]
-
-            # Chỉ kiểm tra các trường bắt buộc
-            if not params[0] or not params[1] or not params[2] or not params[6]:
-                logging.error(f"Skip insert agent with missing required fields: {params}")
-                return False
-
-            # Đăng ký agent vào bảng Agents
-            insert_agent_query = """
-            INSERT INTO Agents (Hostname, OSType, OSVersion, Architecture, IPAddress, MACAddress, AgentVersion, Status, IsActive, FirstSeen, LastHeartbeat, LastSeen)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'Online', 1, GETDATE(), GETDATE(), GETDATE())
-            """
-            self.db.execute_query(insert_agent_query, tuple(params))
-
-            # Gán rules cho agent
-            # 1. Lấy các rules global (IsGlobal = 1)
-            select_global_rules_query = """
-            SELECT RuleID FROM Rules
-            WHERE IsActive = 1 AND IsGlobal = 1
-            """
-            global_rule_rows = self.db.execute_query(select_global_rules_query)
-            global_rule_ids = [row[0] for row in global_rule_rows]
-
-            # 2. Lấy các rules riêng cho OS (IsGlobal = 0 và OSType = ?)
-            select_os_rules_query = """
-            SELECT RuleID FROM Rules
-            WHERE IsActive = 1 AND IsGlobal = 0 AND OSType = ?
-            """
-            os_rule_rows = self.db.execute_query(select_os_rules_query, (agent_data.get('OSType'),))
-            os_rule_ids = [row[0] for row in os_rule_rows]
-
-            # 3. Gán tất cả rules cho agent
-            all_rule_ids = global_rule_ids + os_rule_ids
-            for rule_id in all_rule_ids:
-                insert_agent_rule_query = """
-                IF NOT EXISTS (SELECT 1 FROM AgentRules WHERE RuleID = ? AND Hostname = ?)
-                BEGIN
-                    INSERT INTO AgentRules (RuleID, Hostname, IsActive, AppliedAt)
-                    VALUES (?, ?, 1, GETDATE())
-                END
-                """
-                self.db.execute_query(insert_agent_rule_query, (rule_id, agent_data.get('Hostname'), rule_id, agent_data.get('Hostname')))
-
-            logging.info(f"Assigned {len(all_rule_ids)} rules to agent {agent_data.get('Hostname')} ({len(global_rule_ids)} global, {len(os_rule_ids)} OS-specific)")
-            return True
-        except Exception as e:
-            logging.error(f"Error registering agent and assigning rules: {e}")
-            return False
-
-    def update_agent_status(self, hostname, is_online):
-        """Cập nhật trạng thái online/offline cho agent"""
-        try:
-            status = 'Online' if is_online else 'Offline'
-            query = "UPDATE Agents SET Status = ?, LastSeen = GETDATE() WHERE Hostname = ?"
-            self.db.execute_query(query, (status, hostname))
-            logging.info(f"Cập nhật trạng thái agent {hostname} thành {status}")
-            return True
-        except Exception as e:
-            logging.error(f"Lỗi cập nhật trạng thái agent {hostname}: {e}")
-            return False
-
-    def get_agent_status(self, hostname):
-        """Lấy trạng thái online/offline và thời gian cuối cùng của agent"""
-        try:
-            query = "SELECT Status FROM Agents WHERE Hostname = ?"
-            cursor = self.db.execute_query(query, (hostname,))
+            query = "SELECT * FROM Agents WHERE IsActive = 1 ORDER BY Hostname"
+            cursor = self.db.execute_query(query)
+            
             if cursor:
-                result = cursor.fetchone()
-                return result[0] if result else None
-            return None
-        except Exception:
-            return None
-
-    def get_agents(self, os_type=None):
-        """Get list of agents."""
-        try:
-            query = """
-                SELECT 
-                    Hostname, OSType, OSVersion, Architecture,
-                    IPAddress, Status, LastSeen
-                FROM Agents
-                WHERE IsActive = 1
-                AND (? IS NULL OR OSType = ?)
-                ORDER BY OSType, Hostname
-            """
-            return self.db.execute_query(query, (os_type, os_type))
+                columns = [column[0] for column in cursor.description]
+                rows = cursor.fetchall()
+                
+                agents = []
+                for row in rows:
+                    agent_dict = {}
+                    for i, value in enumerate(row):
+                        col_name = columns[i]
+                        # Convert datetime to string
+                        if hasattr(value, 'strftime'):
+                            agent_dict[col_name] = value.strftime('%Y-%m-%d %H:%M:%S')
+                        else:
+                            agent_dict[col_name] = value
+                    agents.append(agent_dict)
+                
+                return agents
+            
+            return []
+            
         except Exception as e:
-            print(f"Error getting agents: {e}")
+            logging.error(f"Error getting all agents: {e}")
             return []
 
-    def get_agent_rules(self, hostname):
+    def update_agent_status(self, hostname: str, status: str) -> bool:
+        """Update agent status"""
+        try:
+            update_data = {
+                'Status': status,
+                'LastSeen': 'GETDATE()'
+            }
+            
+            success = self.db.update_data('Agents', update_data, 'Hostname = ?', [hostname])
+            if success:
+                logging.info(f"Agent status updated: {hostname} -> {status}")
+            return success
+            
+        except Exception as e:
+            logging.error(f"Error updating agent status for {hostname}: {e}")
+            return False
+
+    def update_heartbeat(self, hostname: str) -> bool:
+        """Update agent heartbeat"""
+        try:
+            update_data = {
+                'LastHeartbeat': 'GETDATE()',
+                'LastSeen': 'GETDATE()',
+                'Status': 'Online'
+            }
+            
+            success = self.db.update_data('Agents', update_data, 'Hostname = ?', [hostname])
+            return success
+            
+        except Exception as e:
+            logging.error(f"Error updating heartbeat for {hostname}: {e}")
+            return False
+
+    def get_agent_rules(self, hostname: str) -> List[int]:
         """Get all rules assigned to an agent"""
         try:
             query = """
-            SELECT r.RuleID 
-            FROM Rules r
-            JOIN AgentRules ar ON r.RuleID = ar.RuleID
-            WHERE ar.Hostname = ?
+                SELECT r.RuleID 
+                FROM Rules r
+                JOIN AgentRules ar ON r.RuleID = ar.RuleID
+                WHERE ar.Hostname = ? AND ar.IsActive = 1
             """
-            rules = self.db.execute_query(query, (hostname,))
-            return [rule[0] for rule in rules]  # Return list of RuleIDs
-        except Exception as e:
-            logging.error(f"Error getting agent rules: {e}")
-            return [] 
-
-    def assign_rule(self, hostname, rule_id):
-        """Gán rule cho agent (nếu chưa có)"""
-        try:
-            query = """
-            IF NOT EXISTS (SELECT 1 FROM AgentRules WHERE RuleID = ? AND Hostname = ?)
-            BEGIN
-                INSERT INTO AgentRules (RuleID, Hostname, IsActive, AppliedAt)
-                VALUES (?, ?, 1, GETDATE())
-            END
-            """
-            self.db.execute_query(query, (rule_id, hostname, rule_id, hostname))
-            return True
-        except Exception as e:
-            logging.error(f"Error assigning rule {rule_id} to agent {hostname}: {e}")
-            return False 
-
-def get_db_connection():
-    """Tạo kết nối đến database"""
-    try:
-        conn = sqlite3.connect('database/edr.db')
-        conn.row_factory = sqlite3.Row
-        return conn
-    except Exception as e:
-        logger.error(f"Error connecting to database: {e}")
-        return None
-
-def register_agent(agent_info):
-    """Đăng ký agent mới"""
-    try:
-        conn = get_db_connection()
-        if not conn:
-            return False
+            cursor = self.db.execute_query(query, [hostname])
             
-        cursor = conn.cursor()
-        
-        # Kiểm tra agent đã tồn tại chưa
-        cursor.execute('SELECT * FROM agents WHERE hostname = ?', (agent_info['hostname'],))
-        existing_agent = cursor.fetchone()
-        
-        if existing_agent:
-            # Cập nhật thông tin agent
-            cursor.execute('''
-                UPDATE agents 
-                SET ip_address = ?, os_info = ?, system_type = ?, status = ?, last_seen = CURRENT_TIMESTAMP
-                WHERE hostname = ?
-            ''', (
-                agent_info['ip_address'],
-                agent_info['os_info'],
-                agent_info.get('system_type', 'Unknown'),
-                agent_info.get('status', 'Online'),
-                agent_info['hostname']
-            ))
-            logger.info(f"SUCCESS: Agent updated - {agent_info['hostname']}")
-        else:
-            # Thêm agent mới
-            cursor.execute('''
-                INSERT INTO agents (hostname, ip_address, os_info, system_type, status, first_seen, last_seen)
-                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-            ''', (
-                agent_info['hostname'],
-                agent_info['ip_address'],
-                agent_info['os_info'],
-                agent_info.get('system_type', 'Unknown'),
-                agent_info.get('status', 'Online')
-            ))
-            logger.info(f"SUCCESS: New agent registered - {agent_info['hostname']}")
+            if cursor:
+                return [row[0] for row in cursor.fetchall()]
             
-        conn.commit()
-        conn.close()
-        return True
-        
-    except Exception as e:
-        logger.error(f"ERROR: Failed to register agent - {e}")
-        if conn:
-            conn.close()
-        return False
-
-def update_agent_status(agent_info):
-    """Cập nhật trạng thái agent"""
-    try:
-        conn = get_db_connection()
-        if not conn:
-            return False
-            
-        cursor = conn.cursor()
-        
-        # Cập nhật trạng thái và thời gian cuối
-        cursor.execute('''
-            UPDATE agents 
-            SET status = ?, last_seen = CURRENT_TIMESTAMP
-            WHERE hostname = ?
-        ''', (agent_info['status'], agent_info['hostname']))
-        
-        if cursor.rowcount > 0:
-            logger.info(f"SUCCESS: Agent status updated - {agent_info['hostname']} ({agent_info['status']})")
-        else:
-            logger.warning(f"Agent not found: {agent_info['hostname']}")
-            
-        conn.commit()
-        conn.close()
-        return True
-        
-    except Exception as e:
-        logger.error(f"ERROR: Failed to update agent status - {e}")
-        if conn:
-            conn.close()
-        return False
-
-def update_agent_heartbeat(hostname):
-    """Cập nhật heartbeat của agent"""
-    try:
-        conn = get_db_connection()
-        if not conn:
-            return False
-            
-        cursor = conn.cursor()
-        
-        # Cập nhật thời gian cuối
-        cursor.execute('''
-            UPDATE agents 
-            SET last_seen = CURRENT_TIMESTAMP
-            WHERE hostname = ?
-        ''', (hostname,))
-        
-        if cursor.rowcount > 0:
-            logger.debug(f"Agent heartbeat updated - {hostname}")
-        else:
-            logger.warning(f"Agent not found: {hostname}")
-            
-        conn.commit()
-        conn.close()
-        return True
-        
-    except Exception as e:
-        logger.error(f"ERROR: Failed to update agent heartbeat - {e}")
-        if conn:
-            conn.close()
-        return False
-
-def get_agent_status(hostname):
-    """Lấy trạng thái của agent"""
-    try:
-        conn = get_db_connection()
-        if not conn:
-            return None
-            
-        cursor = conn.cursor()
-        cursor.execute('SELECT status, last_seen FROM agents WHERE hostname = ?', (hostname,))
-        agent = cursor.fetchone()
-        
-        conn.close()
-        
-        if agent:
-            # Kiểm tra nếu agent không hoạt động trong 5 phút
-            last_seen = datetime.strptime(agent['last_seen'], '%Y-%m-%d %H:%M:%S')
-            if datetime.now() - last_seen > timedelta(minutes=5):
-                return 'Offline'
-            return agent['status']
-        return None
-        
-    except Exception as e:
-        logger.error(f"ERROR: Failed to get agent status - {e}")
-        if conn:
-            conn.close()
-        return None
-
-def get_all_agents():
-    """Lấy danh sách tất cả agent"""
-    try:
-        conn = get_db_connection()
-        if not conn:
             return []
             
-        cursor = conn.cursor()
-        cursor.execute('''
-            SELECT hostname, ip_address, os_info, system_type, status, first_seen, last_seen
-            FROM agents
-            ORDER BY last_seen DESC
-        ''')
-        
-        agents = []
-        for row in cursor.fetchall():
-            # Kiểm tra trạng thái thực tế
-            last_seen = datetime.strptime(row['last_seen'], '%Y-%m-%d %H:%M:%S')
-            status = row['status']
-            if datetime.now() - last_seen > timedelta(minutes=5):
-                status = 'Offline'
-                
-            agents.append({
-                'hostname': row['hostname'],
-                'ip_address': row['ip_address'],
-                'os_info': row['os_info'],
-                'system_type': row['system_type'],
-                'status': status,
-                'first_seen': row['first_seen'],
-                'last_seen': row['last_seen']
-            })
-            
-        conn.close()
-        return agents
-        
-    except Exception as e:
-        logger.error(f"ERROR: Failed to get agents - {e}")
-        if conn:
-            conn.close()
-        return []
+        except Exception as e:
+            logging.error(f"Error getting agent rules for {hostname}: {e}")
+            return []
 
-def cleanup_offline_agents():
-    """Dọn dẹp các agent offline"""
-    try:
-        conn = get_db_connection()
-        if not conn:
+    def assign_rule(self, hostname: str, rule_id: int) -> bool:
+        """Assign a rule to an agent"""
+        try:
+            # Check if rule assignment already exists
+            check_query = """
+                SELECT 1 FROM AgentRules 
+                WHERE RuleID = ? AND Hostname = ?
+            """
+            existing = self.db.execute_query(check_query, [rule_id, hostname])
+            
+            if existing and existing.fetchone():
+                logging.info(f"Rule {rule_id} already assigned to agent {hostname}")
+                return True
+            
+            # Insert new rule assignment
+            rule_assignment = {
+                'RuleID': rule_id,
+                'Hostname': hostname,
+                'IsActive': True
+            }
+            
+            success = self.db.insert_data('AgentRules', rule_assignment)
+            if success:
+                logging.info(f"Rule {rule_id} assigned to agent {hostname}")
+            
+            return success
+            
+        except Exception as e:
+            logging.error(f"Error assigning rule {rule_id} to agent {hostname}: {e}")
             return False
+
+    def cleanup_offline_agents(self, offline_threshold_minutes: int = 5) -> int:
+        """Mark agents as offline if they haven't sent heartbeat recently"""
+        try:
+            update_data = {'Status': 'Offline'}
+            where_clause = f"Status != 'Offline' AND LastHeartbeat < DATEADD(minute, -{offline_threshold_minutes}, GETDATE())"
             
-        cursor = conn.cursor()
-        
-        # Cập nhật trạng thái các agent không hoạt động trong 5 phút
-        cursor.execute('''
-            UPDATE agents 
-            SET status = 'Offline'
-            WHERE datetime(last_seen) < datetime('now', '-5 minutes')
-            AND status != 'Offline'
-        ''')
-        
-        if cursor.rowcount > 0:
-            logger.info(f"SUCCESS: Marked {cursor.rowcount} agents as offline")
+            success = self.db.update_data('Agents', update_data, where_clause)
+            if success:
+                # Get count of updated agents
+                count_query = f"SELECT COUNT(*) FROM Agents WHERE {where_clause.replace('Status !=', 'Status =')}"
+                cursor = self.db.execute_query(count_query)
+                count = cursor.fetchone()[0] if cursor else 0
+                
+                if count > 0:
+                    logging.info(f"Marked {count} agents as offline")
+                return count
             
-        conn.commit()
-        conn.close()
-        return True
-        
-    except Exception as e:
-        logger.error(f"ERROR: Failed to cleanup offline agents - {e}")
-        if conn:
-            conn.close()
-            return False 
+            return 0
+            
+        except Exception as e:
+            logging.error(f"Error cleaning up offline agents: {e}")
+            return 0

@@ -1,8 +1,8 @@
-import logging
 from .connection import DatabaseConnection
+import logging
 import json
-import sqlite3
 from datetime import datetime
+from typing import Dict, List, Optional, Any, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -11,528 +11,788 @@ class RuleDB:
         self.db = DatabaseConnection()
         self.db.connect()
 
-    def get_all_rules(self):
+    def get_all_rules(self) -> List[Dict]:
+        """Get all rules with dynamic field extraction"""
         try:
             query = """
-                SELECT RuleID, RuleName, RuleType, Description, Severity, IsActive, CreatedAt, UpdatedAt, Action, IsGlobal, OSType
-                FROM Rules
+                SELECT * FROM Rules
                 ORDER BY CreatedAt DESC
             """
-            rows = self.db.execute_query(query)
-            rules = []
-            if rows:
+            cursor = self.db.execute_query(query)
+            
+            if cursor:
+                columns = [column[0] for column in cursor.description]
+                rows = cursor.fetchall()
+                
+                rules = []
                 for row in rows:
-                    try:
-                        rules.append({
-                            "RuleID": row.RuleID,
-                            "RuleName": row.RuleName,
-                            "RuleType": row.RuleType,
-                            "Description": row.Description,
-                            "Severity": row.Severity,
-                            "IsActive": bool(row.IsActive),
-                            "CreatedAt": row.CreatedAt.strftime('%Y-%m-%d %H:%M:%S') if row.CreatedAt else None,
-                            "UpdatedAt": row.UpdatedAt.strftime('%Y-%m-%d %H:%M:%S') if row.UpdatedAt else None,
-                            "Action": row.Action,
-                            "IsGlobal": bool(row.IsGlobal),
-                            "OSType": row.OSType
-                        })
-                    except Exception as e:
-                        logging.error(f"Error parsing rule: {e}")
-            return rules
+                    rule_dict = {}
+                    for i, value in enumerate(row):
+                        col_name = columns[i]
+                        # Convert datetime to string
+                        if hasattr(value, 'strftime'):
+                            rule_dict[col_name] = value.strftime('%Y-%m-%d %H:%M:%S')
+                        # Convert bit fields to boolean
+                        elif col_name in ['IsActive', 'IsGlobal'] and isinstance(value, int):
+                            rule_dict[col_name] = bool(value)
+                        else:
+                            rule_dict[col_name] = value
+                    rules.append(rule_dict)
+                
+                return rules
+            
+            return []
+            
         except Exception as e:
-            logging.error(f"Error fetching rules: {e}")
+            logging.error(f"Error fetching all rules: {e}")
             return []
 
-    def create_rule(self, data):
+    def create_rule(self, rule_data: Dict) -> bool:
+        """Create rule with dynamic field mapping"""
         try:
-            query = """
-                INSERT INTO Rules (RuleName, RuleType, Description, Severity, IsActive, CreatedAt, UpdatedAt, Action, IsGlobal, OSType)
-                VALUES (?, ?, ?, ?, ?, GETDATE(), GETDATE(), ?, ?, ?)
-            """
-            params = (
-                data.get("name"),
-                data.get("type"),
-                data.get("description"),
-                data.get("severity"),
-                1 if data.get("is_active") else 0,
-                data.get("action"),
-                1 if data.get("is_global") else 0,
-                data.get("os_type") or 'All'
-            )
-            self.db.execute_query(query, params)
+            if not rule_data:
+                logging.error("Empty rule data received")
+                return False
+            
+            # Normalize rule data
+            normalized_data = self._normalize_rule_data(rule_data)
+            if not normalized_data:
+                logging.error("Failed to normalize rule data")
+                return False
+            
+            # Validate rule data
+            if not self._validate_rule_data(normalized_data):
+                logging.error("Rule data validation failed")
+                return False
+            
+            # Insert rule into database
+            success = self.db.insert_data('Rules', normalized_data)
+            
+            if success:
+                logging.info(f"Rule created: {normalized_data.get('RuleName', 'unknown')}")
+            else:
+                logging.error("Failed to insert rule into database")
+                
+            return success
+            
         except Exception as e:
             logging.error(f"Error creating rule: {e}")
+            return False
 
-    def update_rule(self, rule_id, data):
+    def _normalize_rule_data(self, rule_data: Dict) -> Optional[Dict]:
+        """Normalize rule data with dynamic field mapping"""
+        try:
+            # Get table schema
+            schema = self.db.get_table_schema('Rules')
+            if not schema:
+                logging.error("No schema found for Rules table")
+                return None
+            
+            available_columns = set(schema.get('columns', {}).keys())
+            normalized = {}
+            
+            # Field mapping for various possible field names
+            field_mappings = {
+                'RuleName': ['RuleName', 'rule_name', 'name', 'title', 'rule_title'],
+                'RuleType': ['RuleType', 'rule_type', 'type', 'category', 'rule_category'],
+                'Description': ['Description', 'description', 'details', 'rule_description'],
+                'Severity': ['Severity', 'severity', 'level', 'priority', 'risk_level'],
+                'IsActive': ['IsActive', 'is_active', 'active', 'enabled'],
+                'Action': ['Action', 'action', 'response', 'rule_action'],
+                'IsGlobal': ['IsGlobal', 'is_global', 'global', 'applies_to_all'],
+                'OSType': ['OSType', 'os_type', 'operating_system', 'platform', 'target_os']
+            }
+            
+            # Map fields dynamically
+            for db_field, possible_names in field_mappings.items():
+                if db_field in available_columns:
+                    value = self._extract_field_value(rule_data, possible_names)
+                    if value is not None:
+                        normalized[db_field] = self._convert_rule_field_value(db_field, value)
+            
+            # Set default values
+            self._set_rule_defaults(normalized)
+            
+            return normalized
+            
+        except Exception as e:
+            logging.error(f"Error normalizing rule data: {e}")
+            return None
+
+    def _extract_field_value(self, rule_data: Dict, possible_names: List[str]) -> Any:
+        """Extract field value from rule data using possible field names"""
+        for name in possible_names:
+            if name in rule_data and rule_data[name] is not None:
+                return rule_data[name]
+        return None
+
+    def _convert_rule_field_value(self, field_name: str, value: Any) -> Any:
+        """Convert rule field value to appropriate type"""
+        if value is None or value == '':
+            return None
+            
+        field_lower = field_name.lower()
+        
+        try:
+            # Boolean fields
+            if any(keyword in field_lower for keyword in ['active', 'global', 'enabled']):
+                if isinstance(value, bool):
+                    return value
+                if isinstance(value, str):
+                    return value.lower() in ['true', '1', 'yes', 'on', 'active', 'enabled']
+                return bool(value)
+            
+            # Validate specific field values
+            elif field_lower == 'severity':
+                valid_severities = ['Low', 'Medium', 'High', 'Critical']
+                str_value = str(value).strip()
+                return str_value if str_value in valid_severities else 'Medium'
+            
+            elif field_lower == 'ruletype':
+                valid_types = ['Process', 'File', 'Network']
+                str_value = str(value).strip()
+                return str_value if str_value in valid_types else 'Process'
+            
+            elif field_lower == 'action':
+                valid_actions = ['Alert', 'AlertAndBlock', 'Block', 'Monitor']
+                str_value = str(value).strip()
+                return str_value if str_value in valid_actions else 'Alert'
+            
+            elif field_lower == 'ostype':
+                valid_os = ['Windows', 'Linux', 'All']
+                str_value = str(value).strip()
+                return str_value if str_value in valid_os else 'All'
+            
+            # String fields - clean up
+            else:
+                str_value = str(value).strip()
+                if str_value.upper() in ['NULL', 'NONE']:
+                    return ''
+                return str_value
+                
+        except (ValueError, TypeError) as e:
+            logging.warning(f"Error converting rule value '{value}' for field '{field_name}': {e}")
+            return str(value) if value else ''
+
+    def _set_rule_defaults(self, normalized: Dict):
+        """Set default values for rule fields"""
+        defaults = {
+            'IsActive': True,
+            'IsGlobal': False,
+            'Severity': 'Medium',
+            'Action': 'Alert',
+            'OSType': 'All'
+        }
+        
+        for field, default_value in defaults.items():
+            if field not in normalized or normalized[field] is None:
+                normalized[field] = default_value
+
+    def _validate_rule_data(self, rule_data: Dict) -> bool:
+        """Validate rule data"""
+        required_fields = ['RuleName', 'RuleType', 'Description', 'Severity']
+        
+        for field in required_fields:
+            if field not in rule_data or not rule_data[field]:
+                logging.error(f"Required rule field '{field}' is missing or empty")
+                return False
+        
+        return True
+
+    def update_rule(self, rule_id: int, rule_data: Dict) -> bool:
+        """Update existing rule"""
+        try:
+            # Normalize rule data
+            normalized_data = self._normalize_rule_data(rule_data)
+            if not normalized_data:
+                logging.error("Failed to normalize rule data for update")
+                return False
+            
+            # Remove fields that shouldn't be updated
+            update_data = {k: v for k, v in normalized_data.items() if k != 'RuleID'}
+            
+            # Add update timestamp
+            update_data['UpdatedAt'] = 'GETDATE()'
+            
+            success = self.db.update_data('Rules', update_data, 'RuleID = ?', [rule_id])
+            
+            if success:
+                logging.info(f"Rule {rule_id} updated successfully")
+            
+            return success
+            
+        except Exception as e:
+            logging.error(f"Error updating rule {rule_id}: {e}")
+            return False
+
+    def delete_rule(self, rule_id: int) -> bool:
+        """Delete rule by ID"""
+        try:
+            # First check if rule is referenced by alerts or agent rules
+            references = self._check_rule_references(rule_id)
+            if references:
+                logging.warning(f"Rule {rule_id} has {references} references, marking as inactive instead of deleting")
+                # Mark as inactive instead of deleting
+                return self.db.update_data('Rules', {'IsActive': False}, 'RuleID = ?', [rule_id])
+            
+            # Safe to delete
+            query = "DELETE FROM Rules WHERE RuleID = ?"
+            cursor = self.db.execute_query(query, [rule_id])
+            
+            if cursor:
+                rows_affected = cursor.rowcount
+                if rows_affected > 0:
+                    logging.info(f"Rule {rule_id} deleted successfully")
+                    return True
+            
+            return False
+            
+        except Exception as e:
+            logging.error(f"Error deleting rule {rule_id}: {e}")
+            return False
+
+    def _check_rule_references(self, rule_id: int) -> int:
+        """Check how many references exist for this rule"""
+        try:
+            total_refs = 0
+            
+            # Check alerts
+            cursor = self.db.execute_query("SELECT COUNT(*) FROM Alerts WHERE RuleID = ?", [rule_id])
+            if cursor:
+                total_refs += cursor.fetchone()[0]
+            
+            # Check agent rules
+            cursor = self.db.execute_query("SELECT COUNT(*) FROM AgentRules WHERE RuleID = ?", [rule_id])
+            if cursor:
+                total_refs += cursor.fetchone()[0]
+            
+            return total_refs
+            
+        except Exception as e:
+            logging.error(f"Error checking rule references for {rule_id}: {e}")
+            return 0
+
+    def get_rule_by_id(self, rule_id: int) -> Optional[Dict]:
+        """Get specific rule by ID"""
+        try:
+            query = "SELECT * FROM Rules WHERE RuleID = ?"
+            cursor = self.db.execute_query(query, [rule_id])
+            
+            if cursor:
+                columns = [column[0] for column in cursor.description]
+                row = cursor.fetchone()
+                
+                if row:
+                    rule_dict = {}
+                    for i, value in enumerate(row):
+                        col_name = columns[i]
+                        # Convert datetime to string
+                        if hasattr(value, 'strftime'):
+                            rule_dict[col_name] = value.strftime('%Y-%m-%d %H:%M:%S')
+                        # Convert bit fields to boolean
+                        elif col_name in ['IsActive', 'IsGlobal'] and isinstance(value, int):
+                            rule_dict[col_name] = bool(value)
+                        else:
+                            rule_dict[col_name] = value
+                    return rule_dict
+            
+            return None
+            
+        except Exception as e:
+            logging.error(f"Error getting rule {rule_id}: {e}")
+            return None
+
+    def get_rules_by_type(self, rule_type: str) -> List[Dict]:
+        """Get rules by type"""
+        try:
+            query = "SELECT * FROM Rules WHERE RuleType = ? AND IsActive = 1 ORDER BY RuleName"
+            cursor = self.db.execute_query(query, [rule_type])
+            
+            if cursor:
+                columns = [column[0] for column in cursor.description]
+                rows = cursor.fetchall()
+                
+                rules = []
+                for row in rows:
+                    rule_dict = {}
+                    for i, value in enumerate(row):
+                        col_name = columns[i]
+                        # Convert datetime to string
+                        if hasattr(value, 'strftime'):
+                            rule_dict[col_name] = value.strftime('%Y-%m-%d %H:%M:%S')
+                        # Convert bit fields to boolean
+                        elif col_name in ['IsActive', 'IsGlobal'] and isinstance(value, int):
+                            rule_dict[col_name] = bool(value)
+                        else:
+                            rule_dict[col_name] = value
+                    rules.append(rule_dict)
+                
+                return rules
+            
+            return []
+            
+        except Exception as e:
+            logging.error(f"Error getting rules by type {rule_type}: {e}")
+            return []
+
+    def get_agent_applicable_rules(self, hostname: str, os_type: str) -> List[Dict]:
+        """Get rules applicable to a specific agent"""
         try:
             query = """
-                UPDATE Rules SET RuleName=?, RuleType=?, Description=?, Severity=?, IsActive=?, UpdatedAt=GETDATE(), Action=?, IsGlobal=?, OSType=?
-                WHERE RuleID=?
+                SELECT r.* FROM Rules r
+                WHERE r.IsActive = 1 
+                AND (r.IsGlobal = 1 OR r.OSType = ? OR r.OSType = 'All')
+                AND NOT EXISTS (
+                    SELECT 1 FROM AgentRules ar 
+                    WHERE ar.RuleID = r.RuleID AND ar.Hostname = ?
+                )
+                ORDER BY r.RuleType, r.Severity DESC, r.RuleName
             """
-            params = (
-                data.get("name"),
-                data.get("type"),
-                data.get("description"),
-                data.get("severity"),
-                1 if data.get("is_active") else 0,
-                data.get("action"),
-                1 if data.get("is_global") else 0,
-                data.get("os_type") or 'All',
-                rule_id
-            )
-            self.db.execute_query(query, params)
+            cursor = self.db.execute_query(query, [os_type, hostname])
+            
+            if cursor:
+                columns = [column[0] for column in cursor.description]
+                rows = cursor.fetchall()
+                
+                rules = []
+                for row in rows:
+                    rule_dict = {}
+                    for i, value in enumerate(row):
+                        col_name = columns[i]
+                        # Convert datetime to string
+                        if hasattr(value, 'strftime'):
+                            rule_dict[col_name] = value.strftime('%Y-%m-%d %H:%M:%S')
+                        # Convert bit fields to boolean
+                        elif col_name in ['IsActive', 'IsGlobal'] and isinstance(value, int):
+                            rule_dict[col_name] = bool(value)
+                        else:
+                            rule_dict[col_name] = value
+                    rules.append(rule_dict)
+                
+                return rules
+            
+            return []
+            
         except Exception as e:
-            logging.error(f"Error updating rule: {e}")
+            logging.error(f"Error getting applicable rules for agent {hostname}: {e}")
+            return []
 
-    def delete_rule(self, rule_id):
+    def get_rules_dashboard(self, filters: Dict = None) -> List[Dict]:
+        """Get rules for dashboard with statistics"""
         try:
-            query = "DELETE FROM RULES WHERE [RuleID]=?"
-            self.db.execute_query(query, (rule_id,))
-        except Exception as e:
-            logging.error(f"Error deleting rule: {e}")
-
-    def get_rules_dashboard(self, rule_type=None, severity=None, is_active=None, action=None):
-        """Get rules for dashboard."""
-        try:
-            # Use stored procedure if available
-            params = (rule_type, severity, is_active, action)
-            return self.db.execute_procedure('sp_GetRulesDashboard', params)
-        except:
-            # Fallback to direct query if procedure not available
             query = """
                 SELECT 
-                    r.RuleID, r.RuleName, r.RuleType, r.Severity,
-                    r.IsActive, r.IsGlobal, r.CreatedAt, r.UpdatedAt,
-                    r.Action,
+                    r.*,
                     COUNT(DISTINCT ar.Hostname) as AppliedAgents,
                     COUNT(DISTINCT a.AlertID) as TriggeredAlerts
                 FROM Rules r
-                LEFT JOIN AgentRules ar ON r.RuleID = ar.RuleID
+                LEFT JOIN AgentRules ar ON r.RuleID = ar.RuleID AND ar.IsActive = 1
                 LEFT JOIN Alerts a ON r.RuleID = a.RuleID
-                WHERE 
-                    (? IS NULL OR r.RuleType = ?)
-                    AND (? IS NULL OR r.Severity = ?)
-                    AND (? IS NULL OR r.IsActive = ?)
-                    AND (? IS NULL OR r.Action = ?)
-                GROUP BY 
-                    r.RuleID, r.RuleName, r.RuleType, r.Severity,
-                    r.IsActive, r.IsGlobal, r.CreatedAt, r.UpdatedAt,
-                    r.Action
-                ORDER BY 
-                    r.RuleType, r.Severity, r.RuleName
             """
-            return self.db.execute_query(query, (
-                rule_type, rule_type,
-                severity, severity,
-                is_active, is_active,
-                action, action
-            ))
-
-    def create_cross_platform_rule(self, rule_data):
-        """Create a cross-platform rule."""
-        try:
-            # Use stored procedure if available
-            params = (
-                rule_data['RuleName'],
-                rule_data['RuleType'],
-                rule_data['Description'],
-                rule_data['Severity'],
-                rule_data['Action'],
-                rule_data.get('IsGlobal', False),
-                rule_data.get('WindowsConditions'),
-                rule_data.get('LinuxConditions')
-            )
-            return self.db.execute_procedure('sp_CreateCrossPlatformRule', params)
-        except:
-            # Fallback to direct query if procedure not available
-            # First create the rule
-            rule_result = self.create_rule(rule_data)
-            if not rule_result:
-                return False
-
-            # Get the created rule ID
-            query = "SELECT TOP 1 RuleID FROM Rules WHERE RuleName = ? ORDER BY RuleID DESC"
-            result = self.db.execute_query(query, (rule_data['RuleName'],))
-            if not result:
-                return False
-
-            rule_id = result[0][0]
-
-            # Add Windows conditions if any
-            if 'WindowsConditions' in rule_data:
-                for condition in rule_data['WindowsConditions']:
-                    data = {
-                        'RuleID': rule_id,
-                        'ProcessName': condition.get('ProcessName'),
-                        'ProcessPath': condition.get('ProcessPath')
-                    }
-                    self.db.execute_insert('ProcessRuleConditions', data)
-
-            # Add Linux conditions if any
-            if 'LinuxConditions' in rule_data:
-                for condition in rule_data['LinuxConditions']:
-                    data = {
-                        'RuleID': rule_id,
-                        'ProcessName': condition.get('ProcessName'),
-                        'ProcessPath': condition.get('ProcessPath')
-                    }
-                    self.db.execute_insert('ProcessRuleConditions', data)
-
-            return True 
-
-    def check_rule_violation(self, rule_id, log_data):
-        """Kiểm tra vi phạm rule dựa trên log data"""
-        try:
-            # Lấy thông tin rule
-            rule_query = """
-            SELECT RuleType, Severity, Action, OSType
-            FROM Rules
-            WHERE RuleID = ? AND IsActive = 1
-            """
-            rule = self.db.execute_query(rule_query, (rule_id,))
-            if not rule:
-                return None
-
-            rule = rule[0]
-            rule_type = rule.RuleType
-            severity = rule.Severity
-            action = rule.Action
-            os_type = rule.OSType
-
-            # Kiểm tra điều kiện dựa trên loại rule
-            if rule_type == 'Process':
-                return self._check_process_rule(rule_id, log_data, severity, action)
-            elif rule_type == 'File':
-                return self._check_file_rule(rule_id, log_data, severity, action)
-            elif rule_type == 'Network':
-                return self._check_network_rule(rule_id, log_data, severity, action)
+            params = []
             
-            return None
-        except Exception as e:
-            logging.error(f"Error checking rule violation: {e}")
-            return None
-
-    def _check_process_rule(self, rule_id, log_data, severity, action):
-        """Kiểm tra vi phạm rule process"""
-        try:
-            # Lấy điều kiện của rule
-            conditions_query = """
-            SELECT ProcessName, ProcessPath
-            FROM ProcessRuleConditions
-            WHERE RuleID = ?
-            """
-            conditions = self.db.execute_query(conditions_query, (rule_id,))
+            # Add WHERE clause if filters provided
+            if filters:
+                where_conditions = ['1=1']  # Always true condition to simplify AND logic
+                
+                if 'rule_type' in filters and filters['rule_type']:
+                    where_conditions.append("r.RuleType = ?")
+                    params.append(filters['rule_type'])
+                
+                if 'severity' in filters and filters['severity']:
+                    where_conditions.append("r.Severity = ?")
+                    params.append(filters['severity'])
+                
+                if 'is_active' in filters and filters['is_active'] is not None:
+                    where_conditions.append("r.IsActive = ?")
+                    params.append(1 if filters['is_active'] else 0)
+                
+                if 'action' in filters and filters['action']:
+                    where_conditions.append("r.Action = ?")
+                    params.append(filters['action'])
+                
+                query += " WHERE " + " AND ".join(where_conditions)
             
-            if not conditions:
-                return None
-
-            # Kiểm tra từng điều kiện
-            for condition in conditions:
-                process_name = condition.ProcessName
-                process_path = condition.ProcessPath
-
-                # Kiểm tra tên process
-                if process_name and process_name.lower() in log_data.get('ProcessName', '').lower():
-                    return {
-                        'severity': severity,
-                        'action': action,
-                        'detection_data': json.dumps(log_data)
-                    }
-
-                # Kiểm tra đường dẫn process
-                if process_path and process_path.lower() in log_data.get('ExecutablePath', '').lower():
-                    return {
-                        'severity': severity,
-                        'action': action,
-                        'detection_data': json.dumps(log_data)
-                    }
-
-            return None
-        except Exception as e:
-            logging.error(f"Error checking process rule: {e}")
-            return None
-
-    def _check_file_rule(self, rule_id, log_data, severity, action):
-        """Kiểm tra vi phạm rule file"""
-        try:
-            # Lấy điều kiện của rule
-            conditions_query = """
-            SELECT FileName, FilePath
-            FROM FileRuleConditions
-            WHERE RuleID = ?
+            query += """
+                GROUP BY r.RuleID, r.RuleName, r.RuleType, r.Description, r.Severity,
+                         r.IsActive, r.CreatedAt, r.UpdatedAt, r.Action, r.IsGlobal, r.OSType
+                ORDER BY r.RuleType, r.Severity DESC, r.RuleName
             """
-            conditions = self.db.execute_query(conditions_query, (rule_id,))
             
-            if not conditions:
-                return None
-
-            # Kiểm tra từng điều kiện
-            for condition in conditions:
-                file_name = condition.FileName
-                file_path = condition.FilePath
-
-                # Kiểm tra tên file
-                if file_name and file_name.lower() in log_data.get('FileName', '').lower():
-                    return {
-                        'severity': severity,
-                        'action': action,
-                        'detection_data': json.dumps(log_data)
-                    }
-
-                # Kiểm tra đường dẫn file
-                if file_path and file_path.lower() in log_data.get('FilePath', '').lower():
-                    return {
-                        'severity': severity,
-                        'action': action,
-                        'detection_data': json.dumps(log_data)
-                    }
-
-            return None
-        except Exception as e:
-            logging.error(f"Error checking file rule: {e}")
-            return None
-
-    def _check_network_rule(self, rule_id, log_data, severity, action):
-        """Kiểm tra vi phạm rule network"""
-        try:
-            # Lấy điều kiện của rule
-            conditions_query = """
-            SELECT IPAddress, Port, Protocol
-            FROM NetworkRuleConditions
-            WHERE RuleID = ?
-            """
-            conditions = self.db.execute_query(conditions_query, (rule_id,))
+            cursor = self.db.execute_query(query, params)
             
-            if not conditions:
-                return None
-
-            # Kiểm tra từng điều kiện
-            for condition in conditions:
-                ip_address = condition.IPAddress
-                port = condition.Port
-                protocol = condition.Protocol
-
-                # Kiểm tra IP
-                if ip_address and ip_address in [log_data.get('LocalAddress', ''), log_data.get('RemoteAddress', '')]:
-                    return {
-                        'severity': severity,
-                        'action': action,
-                        'detection_data': json.dumps(log_data)
-                    }
-
-                # Kiểm tra port
-                if port and port in [log_data.get('LocalPort', 0), log_data.get('RemotePort', 0)]:
-                    return {
-                        'severity': severity,
-                        'action': action,
-                        'detection_data': json.dumps(log_data)
-                    }
-
-                # Kiểm tra protocol
-                if protocol and protocol.lower() == log_data.get('Protocol', '').lower():
-                    return {
-                        'severity': severity,
-                        'action': action,
-                        'detection_data': json.dumps(log_data)
-                    }
-
-            return None
-        except Exception as e:
-            logging.error(f"Error checking network rule: {e}")
-            return None
-
-def get_db_connection():
-    """Tạo kết nối đến database"""
-    try:
-        conn = sqlite3.connect('edr.db')
-        conn.row_factory = sqlite3.Row
-        return conn
-    except Exception as e:
-        logger.error(f"Error connecting to database: {e}")
-        return None
-
-def get_rules(rule_type=None):
-    """Lấy danh sách rules từ database
-    
-    Args:
-        rule_type (str, optional): Loại rule cần lấy ('process', 'file', 'network'). 
-                                 Nếu None thì lấy tất cả.
-    
-    Returns:
-        list: Danh sách rules
-    """
-    try:
-        conn = get_db_connection()
-        if not conn:
+            if cursor:
+                columns = [column[0] for column in cursor.description]
+                rows = cursor.fetchall()
+                
+                rules = []
+                for row in rows:
+                    rule_dict = {}
+                    for i, value in enumerate(row):
+                        col_name = columns[i]
+                        # Convert datetime to string
+                        if hasattr(value, 'strftime'):
+                            rule_dict[col_name] = value.strftime('%Y-%m-%d %H:%M:%S')
+                        # Convert bit fields to boolean
+                        elif col_name in ['IsActive', 'IsGlobal'] and isinstance(value, int):
+                            rule_dict[col_name] = bool(value)
+                        else:
+                            rule_dict[col_name] = value
+                    rules.append(rule_dict)
+                
+                return rules
+            
             return []
             
-        cursor = conn.cursor()
-        
-        if rule_type:
-            cursor.execute("""
-                SELECT * FROM rules 
-                WHERE RuleType = ? AND Enabled = 1
-                ORDER BY RuleID
-            """, (rule_type,))
-        else:
-            cursor.execute("""
-                SELECT * FROM rules 
-                WHERE Enabled = 1
-                ORDER BY RuleID
-            """)
-            
-        rules = [dict(row) for row in cursor.fetchall()]
-        conn.close()
-        
-        logger.info(f"Loaded {len(rules)} rules from database")
-        return rules
-        
-    except Exception as e:
-        logger.error(f"Error getting rules: {e}")
-        return []
+        except Exception as e:
+            logging.error(f"Error getting rules dashboard: {e}")
+            return []
 
-def create_rule(rule_data):
-    """Tạo rule mới
-    
-    Args:
-        rule_data (dict): Thông tin rule cần tạo
-        
-    Returns:
-        bool: True nếu tạo thành công, False nếu thất bại
-    """
-    try:
-        conn = get_db_connection()
-        if not conn:
-            return False
+    def check_rule_violation(self, rule_id: int, log_data: Dict) -> Optional[Dict]:
+        """Check if log data violates a specific rule"""
+        try:
+            # Get rule information
+            rule = self.get_rule_by_id(rule_id)
+            if not rule or not rule.get('IsActive'):
+                return None
             
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            INSERT INTO rules (
-                RuleName, RuleType, RuleDescription, 
-                RuleCondition, Severity, Enabled,
-                CreatedAt, UpdatedAt
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            rule_data.get('name'),
-            rule_data.get('type'),
-            rule_data.get('description'),
-            rule_data.get('condition'),
-            rule_data.get('severity', 'Medium'),
-            rule_data.get('enabled', 1),
-            datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        ))
-        
-        conn.commit()
-        conn.close()
-        
-        logger.info(f"Created new rule: {rule_data.get('name')}")
-        return True
-        
-    except Exception as e:
-        logger.error(f"Error creating rule: {e}")
-        return False
-
-def update_rule(rule_id, rule_data):
-    """Cập nhật rule
-    
-    Args:
-        rule_id (int): ID của rule cần cập nhật
-        rule_data (dict): Thông tin rule cần cập nhật
-        
-    Returns:
-        bool: True nếu cập nhật thành công, False nếu thất bại
-    """
-    try:
-        conn = get_db_connection()
-        if not conn:
-            return False
+            rule_type = rule.get('RuleType')
+            severity = rule.get('Severity')
+            action = rule.get('Action')
             
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            UPDATE rules SET
-                RuleName = ?,
-                RuleType = ?,
-                RuleDescription = ?,
-                RuleCondition = ?,
-                Severity = ?,
-                Enabled = ?,
-                UpdatedAt = ?
-            WHERE RuleID = ?
-        """, (
-            rule_data.get('name'),
-            rule_data.get('type'),
-            rule_data.get('description'),
-            rule_data.get('condition'),
-            rule_data.get('severity'),
-            rule_data.get('enabled', 1),
-            datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            rule_id
-        ))
-        
-        conn.commit()
-        conn.close()
-        
-        logger.info(f"Updated rule ID {rule_id}")
-        return True
-        
-    except Exception as e:
-        logger.error(f"Error updating rule: {e}")
-        return False
-
-def delete_rule(rule_id):
-    """Xóa rule
-    
-    Args:
-        rule_id (int): ID của rule cần xóa
-        
-    Returns:
-        bool: True nếu xóa thành công, False nếu thất bại
-    """
-    try:
-        conn = get_db_connection()
-        if not conn:
-            return False
+            # Check violation based on rule type
+            if rule_type == 'Process':
+                violation_data = self._check_process_rule_violation(rule_id, log_data)
+            elif rule_type == 'File':
+                violation_data = self._check_file_rule_violation(rule_id, log_data)
+            elif rule_type == 'Network':
+                violation_data = self._check_network_rule_violation(rule_id, log_data)
+            else:
+                return None
             
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM rules WHERE RuleID = ?", (rule_id,))
-        
-        conn.commit()
-        conn.close()
-        
-        logger.info(f"Deleted rule ID {rule_id}")
-        return True
-        
-    except Exception as e:
-        logger.error(f"Error deleting rule: {e}")
-        return False
-
-def get_rule_by_id(rule_id):
-    """Lấy thông tin rule theo ID
-    
-    Args:
-        rule_id (int): ID của rule cần lấy
-        
-    Returns:
-        dict: Thông tin rule hoặc None nếu không tìm thấy
-    """
-    try:
-        conn = get_db_connection()
-        if not conn:
+            if violation_data:
+                return {
+                    'rule_id': rule_id,
+                    'rule_name': rule.get('RuleName'),
+                    'severity': severity,
+                    'action': action,
+                    'description': rule.get('Description'),
+                    'detection_data': json.dumps(log_data),
+                    'violation_details': violation_data
+                }
+            
             return None
             
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM rules WHERE RuleID = ?", (rule_id,))
+        except Exception as e:
+            logging.error(f"Error checking rule violation for rule {rule_id}: {e}")
+            return None
+
+    def _check_process_rule_violation(self, rule_id: int, log_data: Dict) -> Optional[Dict]:
+        """Check process rule violation"""
+        try:
+            # Get process rule conditions
+            conditions_query = """
+                SELECT ProcessName, ProcessPath
+                FROM ProcessRuleConditions
+                WHERE RuleID = ?
+            """
+            cursor = self.db.execute_query(conditions_query, [rule_id])
+            
+            conditions = []
+            if cursor:
+                conditions = cursor.fetchall()
+            
+            # If no specific conditions, use default suspicious process detection
+            if not conditions:
+                return self._check_default_process_rules(log_data)
+            
+            # Check each condition
+            process_name = log_data.get('ProcessName', '').lower()
+            executable_path = log_data.get('ExecutablePath', '').lower()
+            
+            for condition in conditions:
+                condition_name = (condition.ProcessName or '').lower()
+                condition_path = (condition.ProcessPath or '').lower()
+                
+                # Check process name match
+                if condition_name and condition_name in process_name:
+                    return {
+                        'matched_condition': 'ProcessName',
+                        'condition_value': condition.ProcessName,
+                        'actual_value': log_data.get('ProcessName', ''),
+                        'match_type': 'contains'
+                    }
+                
+                # Check process path match
+                if condition_path and condition_path in executable_path:
+                    return {
+                        'matched_condition': 'ProcessPath',
+                        'condition_value': condition.ProcessPath,
+                        'actual_value': log_data.get('ExecutablePath', ''),
+                        'match_type': 'contains'
+                    }
+            
+            return None
+            
+        except Exception as e:
+            logging.error(f"Error checking process rule {rule_id}: {e}")
+            return None
+
+    def _check_file_rule_violation(self, rule_id: int, log_data: Dict) -> Optional[Dict]:
+        """Check file rule violation"""
+        try:
+            # Get file rule conditions
+            conditions_query = """
+                SELECT FileName, FilePath
+                FROM FileRuleConditions
+                WHERE RuleID = ?
+            """
+            cursor = self.db.execute_query(conditions_query, [rule_id])
+            
+            conditions = []
+            if cursor:
+                conditions = cursor.fetchall()
+            
+            # If no specific conditions, use default file rules
+            if not conditions:
+                return self._check_default_file_rules(log_data)
+            
+            # Check each condition
+            file_name = log_data.get('FileName', '').lower()
+            file_path = log_data.get('FilePath', '').lower()
+            
+            for condition in conditions:
+                condition_name = (condition.FileName or '').lower()
+                condition_path = (condition.FilePath or '').lower()
+                
+                # Check file name match (support wildcards)
+                if condition_name:
+                    if self._match_pattern(file_name, condition_name):
+                        return {
+                            'matched_condition': 'FileName',
+                            'condition_value': condition.FileName,
+                            'actual_value': log_data.get('FileName', ''),
+                            'match_type': 'pattern'
+                        }
+                
+                # Check file path match
+                if condition_path and condition_path in file_path:
+                    return {
+                        'matched_condition': 'FilePath',
+                        'condition_value': condition.FilePath,
+                        'actual_value': log_data.get('FilePath', ''),
+                        'match_type': 'contains'
+                    }
+            
+            return None
+            
+        except Exception as e:
+            logging.error(f"Error checking file rule {rule_id}: {e}")
+            return None
+
+    def _check_network_rule_violation(self, rule_id: int, log_data: Dict) -> Optional[Dict]:
+        """Check network rule violation"""
+        try:
+            # Get network rule conditions
+            conditions_query = """
+                SELECT IPAddress, Port, Protocol
+                FROM NetworkRuleConditions
+                WHERE RuleID = ?
+            """
+            cursor = self.db.execute_query(conditions_query, [rule_id])
+            
+            conditions = []
+            if cursor:
+                conditions = cursor.fetchall()
+            
+            # If no specific conditions, use default network rules
+            if not conditions:
+                return self._check_default_network_rules(log_data)
+            
+            # Check each condition
+            local_address = log_data.get('LocalAddress', '')
+            remote_address = log_data.get('RemoteAddress', '')
+            local_port = log_data.get('LocalPort', 0)
+            remote_port = log_data.get('RemotePort', 0)
+            protocol = log_data.get('Protocol', '').upper()
+            
+            for condition in conditions:
+                condition_ip = condition.IPAddress or ''
+                condition_port = condition.Port or 0
+                condition_protocol = (condition.Protocol or '').upper()
+                
+                # Check IP address match (support wildcards)
+                if condition_ip:
+                    if (self._match_ip_pattern(local_address, condition_ip) or 
+                        self._match_ip_pattern(remote_address, condition_ip)):
+                        return {
+                            'matched_condition': 'IPAddress',
+                            'condition_value': condition.IPAddress,
+                            'actual_value': f"Local: {local_address}, Remote: {remote_address}",
+                            'match_type': 'ip_pattern'
+                        }
+                
+                # Check port match
+                if condition_port and (condition_port == local_port or condition_port == remote_port):
+                    return {
+                        'matched_condition': 'Port',
+                        'condition_value': condition.Port,
+                        'actual_value': f"Local: {local_port}, Remote: {remote_port}",
+                        'match_type': 'exact'
+                    }
+                
+                # Check protocol match
+                if condition_protocol and condition_protocol == protocol:
+                    return {
+                        'matched_condition': 'Protocol',
+                        'condition_value': condition.Protocol,
+                        'actual_value': protocol,
+                        'match_type': 'exact'
+                    }
+            
+            return None
+            
+        except Exception as e:
+            logging.error(f"Error checking network rule {rule_id}: {e}")
+            return None
+
+    def _check_default_process_rules(self, log_data: Dict) -> Optional[Dict]:
+        """Check default process rules when no specific conditions exist"""
+        suspicious_processes = [
+            'cmd.exe', 'powershell.exe', 'wmic.exe', 'net.exe', 
+            'reg.exe', 'schtasks.exe', 'at.exe', 'sc.exe'
+        ]
         
-        rule = cursor.fetchone()
-        conn.close()
+        process_name = log_data.get('ProcessName', '').lower()
         
-        if rule:
-            return dict(rule)
+        for suspicious in suspicious_processes:
+            if suspicious.lower() in process_name:
+                return {
+                    'matched_condition': 'DefaultSuspiciousProcess',
+                    'condition_value': suspicious,
+                    'actual_value': log_data.get('ProcessName', ''),
+                    'match_type': 'suspicious_process'
+                }
+        
         return None
+
+    def _check_default_file_rules(self, log_data: Dict) -> Optional[Dict]:
+        """Check default file rules when no specific conditions exist"""
+        sensitive_paths = ['system32', 'program files', 'windows']
+        file_path = log_data.get('FilePath', '').lower()
         
-    except Exception as e:
-        logger.error(f"Error getting rule by ID: {e}")
-        return None 
+        for sensitive in sensitive_paths:
+            if sensitive in file_path:
+                return {
+                    'matched_condition': 'DefaultSensitivePath',
+                    'condition_value': sensitive,
+                    'actual_value': log_data.get('FilePath', ''),
+                    'match_type': 'sensitive_path'
+                }
+        
+        return None
+
+    def _check_default_network_rules(self, log_data: Dict) -> Optional[Dict]:
+        """Check default network rules when no specific conditions exist"""
+        suspicious_ports = [22, 23, 3389, 445, 1433, 3306, 5432, 27017]
+        remote_port = log_data.get('RemotePort', 0)
+        
+        if remote_port in suspicious_ports:
+            return {
+                'matched_condition': 'DefaultSuspiciousPort',
+                'condition_value': remote_port,
+                'actual_value': remote_port,
+                'match_type': 'suspicious_port'
+            }
+        
+        return None
+
+    def _match_pattern(self, text: str, pattern: str) -> bool:
+        """Match text against pattern with wildcard support"""
+        try:
+            import fnmatch
+            return fnmatch.fnmatch(text, pattern)
+        except Exception:
+            return pattern in text
+
+    def _match_ip_pattern(self, ip: str, pattern: str) -> bool:
+        """Match IP address against pattern with wildcard support"""
+        try:
+            import fnmatch
+            return fnmatch.fnmatch(ip, pattern)
+        except Exception:
+            return pattern in ip
+
+    def create_cross_platform_rule(self, rule_data: Dict) -> bool:
+        """Create a cross-platform rule with different conditions for Windows/Linux"""
+        try:
+            # First create the main rule
+            if not self.create_rule(rule_data):
+                return False
+            
+            # Get the created rule ID
+            rule_name = rule_data.get('RuleName') or rule_data.get('rule_name')
+            query = "SELECT TOP 1 RuleID FROM Rules WHERE RuleName = ? ORDER BY RuleID DESC"
+            cursor = self.db.execute_query(query, [rule_name])
+            
+            if not cursor:
+                logging.error("Failed to get created rule ID")
+                return False
+            
+            row = cursor.fetchone()
+            if not row:
+                logging.error("No rule found after creation")
+                return False
+            
+            rule_id = row[0]
+            
+            # Add Windows conditions if provided
+            windows_conditions = rule_data.get('WindowsConditions') or rule_data.get('windows_conditions')
+            if windows_conditions:
+                self._add_rule_conditions(rule_id, windows_conditions, 'Windows')
+            
+            # Add Linux conditions if provided
+            linux_conditions = rule_data.get('LinuxConditions') or rule_data.get('linux_conditions')
+            if linux_conditions:
+                self._add_rule_conditions(rule_id, linux_conditions, 'Linux')
+            
+            logging.info(f"Cross-platform rule created successfully: {rule_name}")
+            return True
+            
+        except Exception as e:
+            logging.error(f"Error creating cross-platform rule: {e}")
+            return False
+
+    def _add_rule_conditions(self, rule_id: int, conditions: List[Dict], os_type: str):
+        """Add rule conditions for specific OS"""
+        try:
+            for condition in conditions:
+                if 'ProcessName' in condition or 'ProcessPath' in condition:
+                    condition_data = {
+                        'RuleID': rule_id,
+                        'ProcessName': condition.get('ProcessName'),
+                        'ProcessPath': condition.get('ProcessPath')
+                    }
+                    self.db.insert_data('ProcessRuleConditions', condition_data)
+                
+                elif 'FileName' in condition or 'FilePath' in condition:
+                    condition_data = {
+                        'RuleID': rule_id,
+                        'FileName': condition.get('FileName'),
+                        'FilePath': condition.get('FilePath')
+                    }
+                    self.db.insert_data('FileRuleConditions', condition_data)
+                
+                elif 'IPAddress' in condition or 'Port' in condition or 'Protocol' in condition:
+                    condition_data = {
+                        'RuleID': rule_id,
+                        'IPAddress': condition.get('IPAddress'),
+                        'Port': condition.get('Port'),
+                        'Protocol': condition.get('Protocol')
+                    }
+                    self.db.insert_data('NetworkRuleConditions', condition_data)
+            
+            logging.info(f"Added {len(conditions)} conditions for rule {rule_id} ({os_type})")
+            
+        except Exception as e:
+            logging.error(f"Error adding rule conditions: {e}")
